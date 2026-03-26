@@ -1,0 +1,37 @@
+services:
+  arangodb:
+    image: arangodb:3.12
+    container_name: arango-bench
+    environment:
+      ARANGO_ROOT_PASSWORD: benchmark
+    ports:
+      - "8529:8529"
+    volumes:
+      - arango_data:/var/lib/arangodb3
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+    restart: unless-stopped
+    command: >
+      arangod
+      --server.endpoint tcp://0.0.0.0:8529
+      --vector-index true
+
+  qdrant:
+    image: qdrant/qdrant:v1.17.0
+    container_name: qdrant-bench
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+    restart: unless-stopped
+
+volumes:
+  arango_data:
+  qdrant_data:

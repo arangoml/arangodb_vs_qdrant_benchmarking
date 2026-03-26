@@ -1,0 +1,10 @@
+python-arango
+qdrant-client
+numpy
+datasets
+matplotlib
+seaborn
+tabulate
+tqdm
+psutil
+requests
