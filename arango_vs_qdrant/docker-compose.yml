@@ -11,7 +11,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4g
+          memory: 5g
     restart: unless-stopped
     command: >
       arangod
@@ -29,7 +29,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4g
+          memory: 5g
     restart: unless-stopped
 
 volumes:

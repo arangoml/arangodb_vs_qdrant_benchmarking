@@ -71,15 +71,6 @@ def stop_container(service: str):
     print(f"  {service} container stopped and removed.")
 
 
-def stop_all_containers():
-    """Stop all benchmark containers and remove volumes."""
-    print("\n  Stopping all benchmark containers …")
-    try:
-        _run_compose("down -v", timeout=60)
-    except Exception:
-        pass
-    print("  All containers stopped.")
-
 
 def get_container_memory_usage_mb(container_name: str) -> float | None:
     """Get actual memory usage of a Docker container in MB via Docker API."""

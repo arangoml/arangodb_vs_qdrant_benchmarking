@@ -3,7 +3,6 @@ Qdrant setup, querying, ingestion, and benchmark runner.
 """
 
 import time
-import hashlib
 import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -12,22 +11,20 @@ import numpy as np
 
 from config import (
     QDRANT_HOST, QDRANT_HTTP_PORT, QDRANT_GRPC_PORT,
-    DIMENSIONS, TOP_K_VALUES, CONTAINER_MEMORY_GB, TARGET_DOC_COUNT,
-    FILL_BATCH_SIZE, CONCURRENT_WORKERS, NUM_CATEGORIES, NUM_RUNS,
-    EF_SWEEP,
+    DIMENSIONS, TOP_K_VALUES, CONTAINER_MEMORY_GB,
+    BATCH_SIZE, CONCURRENT_WORKERS, NUM_CATEGORIES, NUM_RUNS,
 )
 from docker import get_container_memory_usage_mb
 from measure import (
-    BenchmarkResult, RecallDurationPoint,
+    BenchmarkResult,
     measure_durations, compute_recall_qrels,
-    generate_synthetic_batch, precompute_corpus_arrays,
 )
 
 
 def make_qdrant_client():
     """Create a new Qdrant gRPC client (one per thread for thread safety)."""
     from qdrant_client import QdrantClient
-    return QdrantClient(host=QDRANT_HOST, port=QDRANT_HTTP_PORT, grpc_port=QDRANT_GRPC_PORT, prefer_grpc=True)
+    return QdrantClient(host=QDRANT_HOST, port=QDRANT_HTTP_PORT, grpc_port=QDRANT_GRPC_PORT, prefer_grpc=True, timeout=1200)
 
 
 def wait_for_qdrant(timeout: int = 120):
@@ -44,8 +41,8 @@ def wait_for_qdrant(timeout: int = 120):
     raise RuntimeError(f"Qdrant not reachable at {QDRANT_HOST}:{QDRANT_HTTP_PORT} after {timeout}s")
 
 
-def setup_qdrant(dim: int):
-    from qdrant_client.models import Distance, VectorParams
+def setup_qdrant(dim: int, m: int | None = None, ef_construct: int | None = None):
+    from qdrant_client.models import Distance, VectorParams, HnswConfigDiff
 
     wait_for_qdrant()
     client = make_qdrant_client()
@@ -54,9 +51,16 @@ def setup_qdrant(dim: int):
     if client.collection_exists(collection):
         client.delete_collection(collection)
 
+    kwargs = {}
+    if m is not None or ef_construct is not None:
+        kwargs["hnsw_config"] = HnswConfigDiff(
+            m=m or 16, ef_construct=ef_construct or 100,
+        )
+
     client.create_collection(
         collection_name=collection,
         vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+        **kwargs,
     )
     return client, collection
 
@@ -88,6 +92,7 @@ def query_qdrant(client, collection: str, query_vec: list[float], k: int,
 
 def measure_throughput_qdrant(collection: str, query_vecs: np.ndarray, k: int,
                               category_filter: str | None = None,
+                              ef: int | None = None,
                               workers: int = CONCURRENT_WORKERS) -> float:
     """Run Qdrant queries concurrently with per-thread clients."""
     import threading
@@ -101,7 +106,7 @@ def measure_throughput_qdrant(collection: str, query_vecs: np.ndarray, k: int,
 
     def _query(q, k):
         client = _get_client()
-        return query_qdrant(client, collection, q, k, category_filter=category_filter)
+        return query_qdrant(client, collection, q, k, category_filter=category_filter, ef=ef)
 
     q_list = [q.tolist() for q in query_vecs]
     start = time.perf_counter()
@@ -114,48 +119,24 @@ def measure_throughput_qdrant(collection: str, query_vecs: np.ndarray, k: int,
 
 
 def measure_memory_qdrant(client, collection: str) -> float:
-    """Return actual memory usage of the Qdrant collection in MB via telemetry API."""
-    try:
-        resp = requests.get(
-            f"http://{QDRANT_HOST}:{QDRANT_HTTP_PORT}/telemetry?details_level=4",
-            timeout=10,
+    """Return actual physical memory usage of Qdrant container in MB via Docker stats."""
+    docker_mb = get_container_memory_usage_mb("qdrant-bench")
+    if docker_mb is None:
+        raise RuntimeError(
+            "Could not read Qdrant container memory from Docker stats. "
+            "Ensure the 'qdrant-bench' container is running."
         )
-        resp.raise_for_status()
-        data = resp.json()
-        total_ram = 0
-        collections = data.get("result", {}).get("collections", {}).get("collections", [])
-        for col in collections:
-            col_name = col.get("id", "")
-            if col_name != collection:
-                continue
-            for shard in col.get("shards", []):
-                for segment in shard.get("local", {}).get("segments", []):
-                    info = segment.get("info", {})
-                    total_ram += info.get("ram_usage_bytes", 0)
-        if total_ram > 0:
-            return total_ram / (1024 * 1024)
-    except Exception as e:
-        print(f"  Warning: telemetry API failed ({e}), falling back to estimate")
-    # Fallback: estimate from point count
-    info = client.get_collection(collection_name=collection)
-    points_count = info.points_count or 0
-    dim = info.config.params.vectors.size if info.config.params.vectors else DIMENSIONS
-    vector_bytes = points_count * dim * 4
-    return vector_bytes * 2.5 / (1024 * 1024)
+    return docker_mb
 
 
-def fill_qdrant_fixed(
-    client, collection: str, corpus: dict, target_docs: int,
-    dim: int = DIMENSIONS,
-) -> tuple[float, int]:
-    """Insert exactly target_docs documents into Qdrant, then wait for HNSW build."""
+def fill_qdrant(client, collection: str, corpus: dict, dim: int = DIMENSIONS) -> tuple[float, float, int]:
+    """Insert all corpus documents into Qdrant, then wait for HNSW build.
+    Returns (ingest_time_s, index_build_time_s, total_inserted)."""
     from qdrant_client.models import PointStruct
 
-    all_ids, corpus_embeddings, corpus_texts = precompute_corpus_arrays(corpus)
-    rng = np.random.default_rng(42)
-    total_inserted = 0
+    all_ids = sorted(corpus.keys())
+    total = len(all_ids)
     point_id = 0
-    subbatch_size = 500
 
     start = time.perf_counter()
 
@@ -167,73 +148,46 @@ def fill_qdrant_fixed(
         wait=True,
     )
 
-    # Phase 1: Insert real corpus documents
-    real_count = min(len(all_ids), target_docs)
-    print(f"  Phase 1: Inserting {real_count:,} real corpus documents …")
-    for i in range(0, real_count, subbatch_size):
+    print(f"  Inserting {total:,} documents …")
+    for i in range(0, total, BATCH_SIZE):
         points = []
-        for j in range(i, min(i + subbatch_size, real_count)):
+        for j in range(i, min(i + BATCH_SIZE, total)):
+            did = all_ids[j]
+            doc = corpus[did]
+            text = f"{doc.get('title', '')}. {doc['text']}"
+            emb = doc["embedding"] if isinstance(doc["embedding"], list) else doc["embedding"].tolist()
             points.append(PointStruct(
                 id=point_id,
-                vector=corpus_embeddings[j].tolist(),
+                vector=emb,
                 payload={
-                    "doc_id": all_ids[j],
-                    "text": corpus_texts[j],
-                    "category": f"cat_{int(hashlib.md5(all_ids[j].encode()).hexdigest(), 16) % NUM_CATEGORIES}",
+                    "doc_id": did,
+                    "text": text,
+                    "category": f"cat_{j % NUM_CATEGORIES}",
                 },
             ))
             point_id += 1
         client.upsert(collection_name=collection, points=points)
-        total_inserted += len(points)
-    print(f"  Phase 1 done: {total_inserted:,} docs inserted")
+        if (i + BATCH_SIZE) % 100_000 < BATCH_SIZE:
+            print(f"    {min(i + BATCH_SIZE, total):,} / {total:,} docs inserted")
 
-    # Phase 2: Fill remainder with synthetic docs
-    remaining = target_docs - total_inserted
-    if remaining > 0:
-        print(f"  Phase 2: Inserting {remaining:,} synthetic docs …")
-        syn_index = 0
-        while total_inserted < target_docs:
-            batch_size = min(FILL_BATCH_SIZE, target_docs - total_inserted)
-            embs, doc_ids, texts, categories = generate_synthetic_batch(
-                corpus_embeddings, corpus_texts, rng, syn_index, batch_size, dim,
-            )
-            syn_index += batch_size
-
-            for i in range(0, batch_size, subbatch_size):
-                sub_end = min(i + subbatch_size, batch_size)
-                points = []
-                for j in range(i, sub_end):
-                    points.append(PointStruct(
-                        id=point_id,
-                        vector=embs[j].tolist(),
-                        payload={
-                            "doc_id": doc_ids[j],
-                            "text": texts[j],
-                            "category": categories[j],
-                        },
-                    ))
-                    point_id += 1
-                client.upsert(collection_name=collection, points=points)
-                total_inserted += len(points)
-            print(f"  {total_inserted:,} / {target_docs:,} docs inserted")
-
-    print(f"  Ingestion complete: {total_inserted:,} docs")
+    print(f"  Ingestion complete: {total:,} docs")
+    ingest_time = time.perf_counter() - start
 
     # Wait for HNSW index to finish building
     print("  Waiting for Qdrant optimizer to finish …")
+    idx_start = time.perf_counter()
     while True:
         info = client.get_collection(collection_name=collection)
         if info.optimizer_status == "ok" or str(info.optimizer_status.value) == "ok":
             break
         time.sleep(0.5)
+    index_build_time = time.perf_counter() - idx_start
 
     docker_mb = get_container_memory_usage_mb("qdrant-bench")
     if docker_mb is not None:
         print(f"  Container memory: {docker_mb:.0f} MB / {CONTAINER_MEMORY_GB * 1024} MB")
 
-    elapsed = time.perf_counter() - start
-    return elapsed, total_inserted
-
+    return ingest_time, index_build_time, total
 
 
 def run_benchmark_qdrant(
@@ -244,16 +198,29 @@ def run_benchmark_qdrant(
     num_runs: int = NUM_RUNS,
     ckpt_db: dict | None = None,
     save_fn=None,
-) -> tuple[BenchmarkResult, list[RecallDurationPoint]]:
-    ckpt_db = ckpt_db or {}
+    hnsw_config: dict | None = None,
+) -> BenchmarkResult:
+    if ckpt_db is None:
+        ckpt_db = {}
     if save_fn is None:
         save_fn = lambda: None
 
+    if hnsw_config:
+        db_label = hnsw_config["name"]
+        ef_search = hnsw_config.get("ef_search")
+        m = hnsw_config.get("m")
+        ef_construct = hnsw_config.get("ef_construct")
+    else:
+        db_label = "Qdrant (Default)"
+        ef_search = None
+        m = None
+        ef_construct = None
+
     print(f"\n{'='*60}")
-    print(f"  Qdrant    |  {TARGET_DOC_COUNT:,} docs  |  index = HNSW  |  protocol = gRPC")
+    print(f"  {db_label}  |  {len(corpus):,} docs  |  index = HNSW  |  protocol = gRPC")
     print(f"{'='*60}")
 
-    # --- Ingest (skip if checkpoint has it and data is still in the container) ---
+    # --- Ingest ---
     ingest_ckpt = ckpt_db.get("ingest")
     client = None
     collection = "documents"
@@ -266,7 +233,8 @@ def run_benchmark_qdrant(
             count = info.points_count
             if count == ingest_ckpt["dataset_size"]:
                 print(f"  Resuming — {count:,} docs already ingested (skipping ingest)")
-                idx_time = ingest_ckpt["index_time_s"]
+                ingest_s = ingest_ckpt["ingest_time_s"]
+                idx_build_s = ingest_ckpt["index_build_time_s"]
                 n = ingest_ckpt["dataset_size"]
                 mem_mb = ingest_ckpt["memory_mb"]
             else:
@@ -275,16 +243,19 @@ def run_benchmark_qdrant(
             ingest_ckpt = None
 
     if not ingest_ckpt:
-        client, collection = setup_qdrant(DIMENSIONS)
-        print(f"  Inserting {TARGET_DOC_COUNT:,} docs …")
-        idx_time, n = fill_qdrant_fixed(client, collection, corpus, TARGET_DOC_COUNT)
-        print(f"  Ingestion done in {idx_time:.2f}s — {n:,} documents")
+        client, collection = setup_qdrant(DIMENSIONS, m=m, ef_construct=ef_construct)
+        ingest_s, idx_build_s, n = fill_qdrant(client, collection, corpus)
+        print(f"  Ingestion done in {ingest_s:.2f}s — {n:,} documents")
+        print(f"  Index built in {idx_build_s:.2f}s")
         mem_mb = measure_memory_qdrant(client, collection)
-        print(f"  Memory usage (est.): {mem_mb:.1f} MB")
-        ckpt_db["ingest"] = {"index_time_s": idx_time, "dataset_size": n, "memory_mb": mem_mb}
+        print(f"  Memory usage: {mem_mb:.1f} MB")
+        ckpt_db["ingest"] = {
+            "ingest_time_s": ingest_s, "index_build_time_s": idx_build_s,
+            "dataset_size": n, "memory_mb": mem_mb,
+        }
         save_fn()
 
-    # --- Measurement runs (skip already-completed runs) ---
+    # --- Measurement runs ---
     completed_runs = ckpt_db.get("runs", [])
     all_p50 = [r["p50"] for r in completed_runs]
     all_p95 = [r["p95"] for r in completed_runs]
@@ -301,11 +272,19 @@ def run_benchmark_qdrant(
     if start_run > 1:
         print(f"\n  Resuming from run {start_run} ({start_run - 1} runs already saved)")
 
-    query_fn = lambda q, k: query_qdrant(client, collection, q, k)
+    query_fn = lambda q, k: query_qdrant(client, collection, q, k, ef=ef_search)
     max_k = max(TOP_K_VALUES)
 
     for run in range(start_run, num_runs + 1):
         print(f"\n  --- Run {run}/{num_runs} ---")
+
+        # Wait for optimizer to be idle before measuring
+        print("  Waiting for optimizer to settle …")
+        while True:
+            info = client.get_collection(collection_name=collection)
+            if info.optimizer_status == "ok" or str(info.optimizer_status.value) == "ok":
+                break
+            time.sleep(0.5)
 
         print("  Measuring query duration …")
         lats = measure_durations(query_fn, query_vecs, k=10)
@@ -317,11 +296,14 @@ def run_benchmark_qdrant(
         all_p99.append(p99)
 
         print(f"  Measuring throughput ({CONCURRENT_WORKERS} workers) …")
-        qps = measure_throughput_qdrant(collection, query_vecs, k=10)
+        qps = measure_throughput_qdrant(collection, query_vecs, k=10, ef=ef_search)
         all_qps.append(qps)
 
         print("  Computing recall@k (vs human relevance judgments) …")
-        retrieved_max_k = [query_qdrant(client, collection, q.tolist(), max_k) for q in query_vecs]
+        retrieved_max_k = [
+            query_qdrant(client, collection, q.tolist(), max_k, ef=ef_search)
+            for q in query_vecs
+        ]
         run_recall = {}
         for k in TOP_K_VALUES:
             recall = compute_recall_qrels(retrieved_max_k, query_ids, qrels, k)
@@ -331,7 +313,9 @@ def run_benchmark_qdrant(
 
         print("  Measuring filtered search duration …")
         f_lats = measure_durations(
-            lambda q, k: query_qdrant(client, collection, q, k, category_filter="cat_0"),
+            lambda q, k: query_qdrant(
+                client, collection, q, k, category_filter="cat_0", ef=ef_search,
+            ),
             query_vecs, k=10,
         )
         fp50 = float(np.percentile(f_lats, 50))
@@ -339,7 +323,6 @@ def run_benchmark_qdrant(
         all_fp50.append(fp50)
         all_fp95.append(fp95)
 
-        # Save checkpoint after each run
         if "runs" not in ckpt_db:
             ckpt_db["runs"] = []
         ckpt_db["runs"].append({
@@ -349,63 +332,11 @@ def run_benchmark_qdrant(
         })
         save_fn()
 
-    # --- Pareto sweep (skip already-completed points) ---
-    completed_pareto = ckpt_db.get("pareto", [])
-    completed_efs = {p["param_value"] for p in completed_pareto}
-
-    sweep_values = sorted(EF_SWEEP)
-    remaining_sweep = [v for v in sweep_values if v not in completed_efs]
-
-    pareto_points = [
-        RecallDurationPoint(
-            db_name="Qdrant", dataset_size=n,
-            param_name="ef", param_value=p["param_value"],
-            recall_at_10=p["recall_at_10"], duration_p50_ms=p["p50"], duration_p95_ms=p["p95"],
-        )
-        for p in completed_pareto
-    ]
-
-    if remaining_sweep:
-        if completed_pareto:
-            print(f"\n  Resuming pareto sweep — {len(completed_pareto)} points already saved")
-        print(f"\n  Sweeping ef: {remaining_sweep}")
-        for ef_val in remaining_sweep:
-            sweep_query_fn = lambda q, k, _ef=ef_val: query_qdrant(client, collection, q, k, ef=_ef)
-
-            for q in query_vecs[:min(10, len(query_vecs))]:
-                sweep_query_fn(q.tolist(), 10)
-
-            lats = []
-            for q in query_vecs:
-                t0 = time.perf_counter()
-                sweep_query_fn(q.tolist(), 10)
-                lats.append((time.perf_counter() - t0) * 1000)
-
-            retrieved = [sweep_query_fn(q.tolist(), 50) for q in query_vecs]
-            recall = compute_recall_qrels(retrieved, query_ids, qrels, 10)
-
-            p50 = float(np.percentile(lats, 50))
-            p95 = float(np.percentile(lats, 95))
-            print(f"    ef={ef_val:>4d}  →  recall@10={recall:.4f}  p50={p50:.2f}ms  p95={p95:.2f}ms")
-
-            point = RecallDurationPoint(
-                db_name="Qdrant", dataset_size=n,
-                param_name="ef", param_value=ef_val,
-                recall_at_10=recall, duration_p50_ms=p50, duration_p95_ms=p95,
-            )
-            pareto_points.append(point)
-
-            if "pareto" not in ckpt_db:
-                ckpt_db["pareto"] = []
-            ckpt_db["pareto"].append({
-                "param_value": ef_val, "recall_at_10": recall, "p50": p50, "p95": p95,
-            })
-            save_fn()
-
     return BenchmarkResult(
-        db_name="Qdrant",
+        db_name=db_label,
         dataset_size=n,
-        index_time_s=idx_time,
+        ingest_time_s=ingest_s,
+        index_build_time_s=idx_build_s,
         duration_p50_ms=statistics.mean(all_p50),
         duration_p50_std=statistics.stdev(all_p50) if len(all_p50) > 1 else 0.0,
         duration_p95_ms=statistics.mean(all_p95),
@@ -422,4 +353,4 @@ def run_benchmark_qdrant(
         filtered_duration_p95_std=statistics.stdev(all_fp95) if len(all_fp95) > 1 else 0.0,
         memory_mb=mem_mb,
         num_runs=num_runs,
-    ), pareto_points
+    )

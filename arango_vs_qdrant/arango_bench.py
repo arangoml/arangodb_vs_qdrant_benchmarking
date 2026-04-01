@@ -3,7 +3,6 @@ ArangoDB setup, querying, ingestion, and benchmark runner.
 """
 
 import time
-import hashlib
 import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -12,21 +11,69 @@ import numpy as np
 
 from config import (
     ARANGO_HOST, ARANGO_DB, ARANGO_USER, ARANGO_PASS, ARANGO_COLLECTION,
-    DIMENSIONS, TOP_K_VALUES, CONTAINER_MEMORY_GB, TARGET_DOC_COUNT,
-    FILL_BATCH_SIZE, CONCURRENT_WORKERS, NUM_CATEGORIES, NUM_RUNS,
-    NPROBE_SWEEP,
+    DIMENSIONS, TOP_K_VALUES, CONTAINER_MEMORY_GB,
+    BATCH_SIZE, CONCURRENT_WORKERS, NUM_CATEGORIES, NUM_RUNS,
 )
 from docker import get_container_memory_usage_mb
 from measure import (
-    BenchmarkResult, RecallDurationPoint,
+    BenchmarkResult,
     measure_durations, compute_recall_qrels,
-    generate_synthetic_batch, precompute_corpus_arrays,
 )
 
 
 def wait_for_arango(timeout: int = 120):
-    """Block until ArangoDB is reachable and ready (handles container restarts)."""
+    """Block until ArangoDB is reachable and past its Docker init-restart cycle.
+
+    The ArangoDB Docker entrypoint passes *all* CMD args (including
+    ``--server.endpoint tcp://0.0.0.0:8529``) to a temporary init arangod.
+    That means the init instance is reachable on port 8529, but it gets
+    SIGTERM'd once init is done and a fresh arangod takes its place.
+
+    We handle this by waiting for the API to come up, then watching for the
+    expected down/up transition.  If the API never goes down (volumes already
+    initialised → no init step), we proceed after a short grace period.
+    """
+    GRACE_SECONDS = 15  # max time to wait for the init-restart
     deadline = time.time() + timeout
+
+    # Phase 1: wait for the API to respond at all
+    while time.time() < deadline:
+        try:
+            r = requests.get(
+                f"{ARANGO_HOST}/_api/version",
+                auth=(ARANGO_USER, ARANGO_PASS),
+                timeout=2,
+            )
+            if r.status_code == 200:
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+    else:
+        raise RuntimeError(f"ArangoDB not reachable at {ARANGO_HOST} after {timeout}s")
+
+    # Phase 2: watch for the init-restart (API goes down after init SIGTERM)
+    grace_deadline = min(time.time() + GRACE_SECONDS, deadline)
+    saw_down = False
+    while time.time() < grace_deadline:
+        try:
+            r = requests.get(
+                f"{ARANGO_HOST}/_api/version",
+                auth=(ARANGO_USER, ARANGO_PASS),
+                timeout=2,
+            )
+            if r.status_code != 200:
+                saw_down = True
+                break
+        except Exception:
+            saw_down = True
+            break
+        time.sleep(1)
+
+    if not saw_down:
+        return  # already initialised, no restart happened
+
+    # Phase 3: wait for the real arangod to come up
     while time.time() < deadline:
         try:
             r = requests.get(
@@ -45,7 +92,7 @@ def wait_for_arango(timeout: int = 120):
 def setup_arango(dim: int):
     from arango import ArangoClient
     wait_for_arango()
-    client = ArangoClient(hosts=ARANGO_HOST, request_timeout=600)
+    client = ArangoClient(hosts=ARANGO_HOST, request_timeout=3600)
     sys_db = client.db("_system", username=ARANGO_USER, password=ARANGO_PASS)
     if sys_db.has_database(ARANGO_DB):
         sys_db.delete_database(ARANGO_DB)
@@ -60,7 +107,6 @@ def setup_arango(dim: int):
     if db.has_collection(ARANGO_COLLECTION):
         db.delete_collection(ARANGO_COLLECTION)
     col = db.create_collection(ARANGO_COLLECTION)
-    # Verify collection is ready for writes with a test document
     for attempt in range(30):
         try:
             col.insert({"_key": "_healthcheck", "test": True})
@@ -72,24 +118,29 @@ def setup_arango(dim: int):
 
 
 def query_arango(db, query_vec: list[float], k: int,
-                 category_filter: str | None = None) -> list[str]:
+                 category_filter: str | None = None,
+                 n_probe: int | None = None) -> list[str]:
     """Run an ANN vector query via AQL using the IVF index. Returns list of doc_id."""
     bind = {"@col": ARANGO_COLLECTION, "qvec": query_vec, "k": k}
 
+    opts = ", { nProbe: @nProbe }" if n_probe is not None else ""
+    if n_probe is not None:
+        bind["nProbe"] = n_probe
+
     if category_filter:
-        aql = """
+        aql = f"""
         FOR doc IN @@col
             FILTER doc.category == @cat
-            LET sim = APPROX_NEAR_COSINE(doc.embedding, @qvec)
+            LET sim = APPROX_NEAR_COSINE(doc.embedding, @qvec{opts})
             SORT sim DESC
             LIMIT @k
             RETURN doc.doc_id
         """
         bind["cat"] = category_filter
     else:
-        aql = """
+        aql = f"""
         FOR doc IN @@col
-            LET sim = APPROX_NEAR_COSINE(doc.embedding, @qvec)
+            LET sim = APPROX_NEAR_COSINE(doc.embedding, @qvec{opts})
             SORT sim DESC
             LIMIT @k
             RETURN doc.doc_id
@@ -110,7 +161,7 @@ def measure_throughput_arango(query_vecs: np.ndarray, k: int,
 
     def _get_db():
         if not hasattr(thread_local, "db"):
-            client = ArangoClient(hosts=ARANGO_HOST, request_timeout=600)
+            client = ArangoClient(hosts=ARANGO_HOST, request_timeout=3600)
             thread_local.db = client.db(ARANGO_DB, username=ARANGO_USER, password=ARANGO_PASS)
         return thread_local.db
 
@@ -129,22 +180,17 @@ def measure_throughput_arango(query_vecs: np.ndarray, k: int,
 
 
 def measure_memory_arango(db) -> float:
-    """Return memory usage of ArangoDB in MB."""
-    col = db.collection(ARANGO_COLLECTION)
-    stats = col.statistics()
-    figures = stats.get("figures", {})
-    indexes_size = figures.get("indexes", {}).get("size", 0)
-    documents_size = figures.get("documents", {}).get("size", 0)
-    api_mb = (indexes_size + documents_size) / (1024 * 1024)
-    if api_mb > 1:
-        return api_mb
+    """Return actual physical memory usage of ArangoDB container in MB via Docker stats."""
     docker_mb = get_container_memory_usage_mb("arango-bench")
-    if docker_mb is not None:
-        return docker_mb
-    return api_mb
+    if docker_mb is None:
+        raise RuntimeError(
+            "Could not read ArangoDB container memory from Docker stats. "
+            "Ensure the 'arango-bench' container is running."
+        )
+    return docker_mb
 
 
-def _insert_subbatches(col, docs: list[dict], subbatch_size: int = 500):
+def _insert_subbatches(col, docs: list[dict], subbatch_size: int = BATCH_SIZE):
     """Insert a large list of docs into ArangoDB in sub-batches with retry."""
     for i in range(0, len(docs), subbatch_size):
         for attempt in range(3):
@@ -159,63 +205,40 @@ def _insert_subbatches(col, docs: list[dict], subbatch_size: int = 500):
                     raise
 
 
-def fill_arango_fixed(
-    db, col, corpus: dict, target_docs: int,
-    dim: int = DIMENSIONS,
-) -> tuple[float, int]:
-    """Insert exactly target_docs documents into ArangoDB, then build the IVF index."""
-    all_ids, corpus_embeddings, corpus_texts = precompute_corpus_arrays(corpus)
-    rng = np.random.default_rng(42)
-    total_inserted = 0
+def fill_arango(db, col, corpus: dict, dim: int = DIMENSIONS) -> tuple[float, float, int]:
+    """Insert all corpus documents into ArangoDB, then build the IVF index.
+    Returns (ingest_time_s, index_build_time_s, total_inserted)."""
+    all_ids = sorted(corpus.keys())
+    total = len(all_ids)
 
     start = time.perf_counter()
 
-    # Phase 1: Insert real corpus documents
-    real_count = min(len(all_ids), target_docs)
-    print(f"  Phase 1: Inserting {real_count:,} real corpus documents …")
+    print(f"  Inserting {total:,} documents …")
     batch = []
-    for i in range(real_count):
-        did = all_ids[i]
+    for i, did in enumerate(all_ids):
+        doc = corpus[did]
+        text = f"{doc.get('title', '')}. {doc['text']}"
         batch.append({
             "_key": did.replace("/", "_"),
             "doc_id": did,
-            "text": corpus_texts[i],
-            "category": f"cat_{int(hashlib.md5(did.encode()).hexdigest(), 16) % NUM_CATEGORIES}",
-            "embedding": corpus_embeddings[i].tolist(),
+            "text": text,
+            "category": f"cat_{i % NUM_CATEGORIES}",
+            "embedding": doc["embedding"] if isinstance(doc["embedding"], list) else doc["embedding"].tolist(),
         })
-    _insert_subbatches(col, batch)
-    total_inserted = len(batch)
-    print(f"  Phase 1 done: {total_inserted:,} docs inserted")
-
-    # Phase 2: Fill remainder with synthetic docs
-    remaining = target_docs - total_inserted
-    if remaining > 0:
-        print(f"  Phase 2: Inserting {remaining:,} synthetic docs …")
-        syn_index = 0
-        while total_inserted < target_docs:
-            batch_size = min(FILL_BATCH_SIZE, target_docs - total_inserted)
-            embs, doc_ids, texts, categories = generate_synthetic_batch(
-                corpus_embeddings, corpus_texts, rng, syn_index, batch_size, dim,
-            )
-            syn_index += batch_size
-            batch = []
-            for i in range(batch_size):
-                batch.append({
-                    "_key": doc_ids[i],
-                    "doc_id": doc_ids[i],
-                    "text": texts[i],
-                    "category": categories[i],
-                    "embedding": embs[i].tolist(),
-                })
+        if len(batch) >= BATCH_SIZE:
             _insert_subbatches(col, batch)
-            total_inserted += len(batch)
-            print(f"  {total_inserted:,} / {target_docs:,} docs inserted")
-
-    print(f"  Ingestion complete: {total_inserted:,} docs")
+            batch = []
+            if (i + 1) % 100_000 == 0:
+                print(f"    {i + 1:,} / {total:,} docs inserted")
+    if batch:
+        _insert_subbatches(col, batch)
+    print(f"  Ingestion complete: {total:,} docs")
+    ingest_time = time.perf_counter() - start
 
     # Build IVF vector index
-    n_lists = max(1, int(total_inserted ** 0.5))
-    print(f"  Creating vector index (nLists={n_lists}) over {total_inserted:,} docs …")
+    n_lists = max(1, int(15 * total ** 0.5))
+    print(f"  Creating vector index (nLists={n_lists}) over {total:,} docs …")
+    idx_start = time.perf_counter()
     col.add_index({
         "type": "vector",
         "name": "vector_cosine",
@@ -225,18 +248,17 @@ def fill_arango_fixed(
             "metric": "cosine",
             "dimension": dim,
             "nLists": n_lists,
-            "defaultNProbe": max(1, n_lists // 4),
+            "defaultNProbe": max(1, int(n_lists ** 0.5)),
             "trainingIterations": 25,
         },
     })
+    index_build_time = time.perf_counter() - idx_start
 
     docker_mb = get_container_memory_usage_mb("arango-bench")
     if docker_mb is not None:
         print(f"  Container memory: {docker_mb:.0f} MB / {CONTAINER_MEMORY_GB * 1024} MB")
 
-    elapsed = time.perf_counter() - start
-    return elapsed, total_inserted
-
+    return ingest_time, index_build_time, total
 
 
 def run_benchmark_arango(
@@ -247,13 +269,14 @@ def run_benchmark_arango(
     num_runs: int = NUM_RUNS,
     ckpt_db: dict | None = None,
     save_fn=None,
-) -> tuple[BenchmarkResult, list[RecallDurationPoint]]:
-    ckpt_db = ckpt_db or {}
+) -> BenchmarkResult:
+    if ckpt_db is None:
+        ckpt_db = {}
     if save_fn is None:
         save_fn = lambda: None
 
     print(f"\n{'='*60}")
-    print(f"  ArangoDB  |  {TARGET_DOC_COUNT:,} docs  |  index = IVF  |  protocol = HTTP")
+    print(f"  ArangoDB  |  {len(corpus):,} docs  |  index = IVF  |  protocol = HTTP")
     print(f"{'='*60}")
 
     # --- Ingest (skip if checkpoint has it and data is still in the container) ---
@@ -264,31 +287,35 @@ def run_benchmark_arango(
         from arango import ArangoClient
         try:
             wait_for_arango()
-            client = ArangoClient(hosts=ARANGO_HOST, request_timeout=600)
+            client = ArangoClient(hosts=ARANGO_HOST, request_timeout=3600)
             db = client.db(ARANGO_DB, username=ARANGO_USER, password=ARANGO_PASS)
             col = db.collection(ARANGO_COLLECTION)
             count = col.count()
             if count == ingest_ckpt["dataset_size"]:
                 print(f"  Resuming — {count:,} docs already ingested (skipping ingest)")
-                idx_time = ingest_ckpt["index_time_s"]
+                ingest_s = ingest_ckpt["ingest_time_s"]
+                idx_build_s = ingest_ckpt["index_build_time_s"]
                 n = ingest_ckpt["dataset_size"]
                 mem_mb = ingest_ckpt["memory_mb"]
             else:
-                ingest_ckpt = None  # count mismatch, redo
+                ingest_ckpt = None
         except Exception:
-            ingest_ckpt = None  # DB not reachable or missing, redo
+            ingest_ckpt = None
 
     if not ingest_ckpt:
         db, col = setup_arango(DIMENSIONS)
-        print(f"  Inserting {TARGET_DOC_COUNT:,} docs …")
-        idx_time, n = fill_arango_fixed(db, col, corpus, TARGET_DOC_COUNT)
-        print(f"  Ingestion done in {idx_time:.2f}s — {n:,} documents")
+        ingest_s, idx_build_s, n = fill_arango(db, col, corpus)
+        print(f"  Ingestion done in {ingest_s:.2f}s — {n:,} documents")
+        print(f"  Index built in {idx_build_s:.2f}s")
         mem_mb = measure_memory_arango(db)
         print(f"  Memory usage: {mem_mb:.1f} MB")
-        ckpt_db["ingest"] = {"index_time_s": idx_time, "dataset_size": n, "memory_mb": mem_mb}
+        ckpt_db["ingest"] = {
+            "ingest_time_s": ingest_s, "index_build_time_s": idx_build_s,
+            "dataset_size": n, "memory_mb": mem_mb,
+        }
         save_fn()
 
-    # --- Measurement runs (skip already-completed runs) ---
+    # --- Measurement runs ---
     completed_runs = ckpt_db.get("runs", [])
     all_p50 = [r["p50"] for r in completed_runs]
     all_p95 = [r["p95"] for r in completed_runs]
@@ -343,7 +370,6 @@ def run_benchmark_arango(
         all_fp50.append(fp50)
         all_fp95.append(fp95)
 
-        # Save checkpoint after each run
         if "runs" not in ckpt_db:
             ckpt_db["runs"] = []
         ckpt_db["runs"].append({
@@ -353,82 +379,11 @@ def run_benchmark_arango(
         })
         save_fn()
 
-    # --- Pareto sweep (skip already-completed points) ---
-    completed_pareto = ckpt_db.get("pareto", [])
-    completed_nprobes = {p["param_value"] for p in completed_pareto}
-
-    n_lists = max(1, int(n ** 0.5))
-    sweep_values = sorted(set(v for v in NPROBE_SWEEP if v <= n_lists))
-
-    remaining_sweep = [v for v in sweep_values if v not in completed_nprobes]
-    pareto_points = [
-        RecallDurationPoint(
-            db_name="ArangoDB", dataset_size=n,
-            param_name="nProbe", param_value=p["param_value"],
-            recall_at_10=p["recall_at_10"], duration_p50_ms=p["p50"], duration_p95_ms=p["p95"],
-        )
-        for p in completed_pareto
-    ]
-
-    if remaining_sweep:
-        if completed_pareto:
-            print(f"\n  Resuming pareto sweep — {len(completed_pareto)} points already saved")
-        print(f"\n  Sweeping nProbe (index rebuild per value): {remaining_sweep}")
-        col = db.collection(ARANGO_COLLECTION)
-        for n_probe in remaining_sweep:
-            try:
-                col.delete_index("vector_cosine")
-            except Exception:
-                pass
-            col.add_index({
-                "type": "vector",
-                "name": "vector_cosine",
-                "fields": ["embedding"],
-                "storedValues": ["category"],
-                "params": {
-                    "metric": "cosine",
-                    "dimension": DIMENSIONS,
-                    "nLists": n_lists,
-                    "defaultNProbe": n_probe,
-                    "trainingIterations": 25,
-                },
-            })
-
-            sweep_query_fn = lambda q, k: query_arango(db, q, k)
-            for q in query_vecs[:min(10, len(query_vecs))]:
-                sweep_query_fn(q.tolist(), 10)
-
-            lats = []
-            for q in query_vecs:
-                t0 = time.perf_counter()
-                sweep_query_fn(q.tolist(), 10)
-                lats.append((time.perf_counter() - t0) * 1000)
-
-            retrieved = [sweep_query_fn(q.tolist(), 50) for q in query_vecs]
-            recall = compute_recall_qrels(retrieved, query_ids, qrels, 10)
-
-            p50 = float(np.percentile(lats, 50))
-            p95 = float(np.percentile(lats, 95))
-            print(f"    nProbe={n_probe:>4d}  →  recall@10={recall:.4f}  p50={p50:.2f}ms  p95={p95:.2f}ms")
-
-            point = RecallDurationPoint(
-                db_name="ArangoDB", dataset_size=n,
-                param_name="nProbe", param_value=n_probe,
-                recall_at_10=recall, duration_p50_ms=p50, duration_p95_ms=p95,
-            )
-            pareto_points.append(point)
-
-            if "pareto" not in ckpt_db:
-                ckpt_db["pareto"] = []
-            ckpt_db["pareto"].append({
-                "param_value": n_probe, "recall_at_10": recall, "p50": p50, "p95": p95,
-            })
-            save_fn()
-
     return BenchmarkResult(
         db_name="ArangoDB",
         dataset_size=n,
-        index_time_s=idx_time,
+        ingest_time_s=ingest_s,
+        index_build_time_s=idx_build_s,
         duration_p50_ms=statistics.mean(all_p50),
         duration_p50_std=statistics.stdev(all_p50) if len(all_p50) > 1 else 0.0,
         duration_p95_ms=statistics.mean(all_p95),
@@ -445,4 +400,4 @@ def run_benchmark_arango(
         filtered_duration_p95_std=statistics.stdev(all_fp95) if len(all_fp95) > 1 else 0.0,
         memory_mb=mem_mb,
         num_runs=num_runs,
-    ), pareto_points
+    )
