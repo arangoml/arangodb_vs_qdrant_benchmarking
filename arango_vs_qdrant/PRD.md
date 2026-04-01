@@ -79,4 +79,4 @@ Checkpointing is supported — interrupted runs resume from the last completed s
 ## Output
 
 - `results.json` — raw benchmark data per doc-count
-- 8 comparison plots (indexing time, query duration, throughput, recall@k, filtered duration, radar summary, memory usage, Pareto recall-vs-duration)
+- 7 comparison plots (load time, query duration, throughput, recall@k, filtered duration, radar summary, memory usage)
