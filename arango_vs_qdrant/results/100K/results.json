@@ -1,0 +1,174 @@
+{
+  "benchmarks": [
+    {
+      "db_name": "ArangoDB",
+      "dataset_size": 100000,
+      "ingest_time_s": 54.83805941703031,
+      "index_build_time_s": 55.64133950002724,
+      "duration_p50_ms": 5.860312502287949,
+      "duration_p50_std": 0.20901288885617494,
+      "duration_p95_ms": 7.5938159434978525,
+      "duration_p95_std": 0.3418861568471851,
+      "duration_p99_ms": 12.222482866491172,
+      "duration_p99_std": 0.3177457156393845,
+      "throughput_qps": 577.9334481472131,
+      "throughput_qps_std": 195.32255488332112,
+      "recall_at_k": {
+        "1": 0.5544370413286983,
+        "5": 0.8664783700270374,
+        "10": 0.9218568945538818,
+        "20": 0.9519360757049053,
+        "50": 0.968279258400927
+      },
+      "recall_at_k_std": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0,
+        "50": 0.0
+      },
+      "filtered_duration_p50_ms": 7.501430663978681,
+      "filtered_duration_p50_std": 0.13174808134566243,
+      "filtered_duration_p95_ms": 8.96749922054975,
+      "filtered_duration_p95_std": 0.08933187928968252,
+      "memory_mb": 1645.568,
+      "num_runs": 3
+    },
+    {
+      "db_name": "Qdrant (Default)",
+      "dataset_size": 100000,
+      "ingest_time_s": 53.595054999983404,
+      "index_build_time_s": 0.005409041012171656,
+      "duration_p50_ms": 5.2959723204063875,
+      "duration_p50_std": 0.14150797200679371,
+      "duration_p95_ms": 8.681773843515353,
+      "duration_p95_std": 2.2078358144908425,
+      "duration_p99_ms": 16.19817166162334,
+      "duration_p99_std": 5.4463869799299305,
+      "throughput_qps": 909.3832299154044,
+      "throughput_qps_std": 308.1109937296636,
+      "recall_at_k": {
+        "1": 0.5621620316724604,
+        "5": 0.8766657010428737,
+        "10": 0.9344100038624952,
+        "20": 0.9651168404789494,
+        "50": 0.9828118964851293
+      },
+      "recall_at_k_std": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0,
+        "50": 0.0
+      },
+      "filtered_duration_p50_ms": 4.86395851476118,
+      "filtered_duration_p50_std": 0.010942464784634853,
+      "filtered_duration_p95_ms": 6.573872980273638,
+      "filtered_duration_p95_std": 0.07449446971614003,
+      "memory_mb": 440.4,
+      "num_runs": 3
+    },
+    {
+      "db_name": "Qdrant (m=32, efc=200, efs=128)",
+      "dataset_size": 100000,
+      "ingest_time_s": 60.67579929198837,
+      "index_build_time_s": 0.004482417018152773,
+      "duration_p50_ms": 6.861124663070465,
+      "duration_p50_std": 0.26905716789377127,
+      "duration_p95_ms": 11.42457469735139,
+      "duration_p95_std": 5.810415920748698,
+      "duration_p99_ms": 18.1001549111291,
+      "duration_p99_std": 11.304652571864276,
+      "throughput_qps": 435.51275008799576,
+      "throughput_qps_std": 106.31002517006388,
+      "recall_at_k": {
+        "1": 0.5633207802240248,
+        "5": 0.8779692931633836,
+        "10": 0.9357135959830051,
+        "20": 0.9664204325994592,
+        "50": 0.9841154886056392
+      },
+      "recall_at_k_std": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0,
+        "50": 0.0
+      },
+      "filtered_duration_p50_ms": 5.2015001710969955,
+      "filtered_duration_p50_std": 0.02034490901289707,
+      "filtered_duration_p95_ms": 6.969171077556286,
+      "filtered_duration_p95_std": 0.11320918839238933,
+      "memory_mb": 719.1,
+      "num_runs": 3
+    },
+    {
+      "db_name": "Qdrant (m=8, efc=50, efs=32)",
+      "dataset_size": 100000,
+      "ingest_time_s": 51.86363329197047,
+      "index_build_time_s": 0.0012250409927219152,
+      "duration_p50_ms": 4.119416669709608,
+      "duration_p50_std": 0.07617249652198911,
+      "duration_p95_ms": 6.555734641733578,
+      "duration_p95_std": 0.032780929798958455,
+      "duration_p99_ms": 18.464962318927654,
+      "duration_p99_std": 1.7725950639758847,
+      "throughput_qps": 987.8968512253072,
+      "throughput_qps_std": 532.0227225287811,
+      "recall_at_k": {
+        "1": 0.5518781382773271,
+        "5": 0.8608294708381614,
+        "10": 0.9163045577443029,
+        "20": 0.9465768636539205,
+        "50": 0.9635477018153727
+      },
+      "recall_at_k_std": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0,
+        "50": 0.0
+      },
+      "filtered_duration_p50_ms": 4.867382163259511,
+      "filtered_duration_p50_std": 0.14283363418369635,
+      "filtered_duration_p95_ms": 6.589497384265996,
+      "filtered_duration_p95_std": 0.14690307341084483,
+      "memory_mb": 671.3,
+      "num_runs": 3
+    },
+    {
+      "db_name": "Qdrant (m=24, efc=150, efs=96)",
+      "dataset_size": 100000,
+      "ingest_time_s": 55.11443241703091,
+      "index_build_time_s": 0.0020292919944040477,
+      "duration_p50_ms": 5.712215487922852,
+      "duration_p50_std": 0.10955281032255895,
+      "duration_p95_ms": 9.16068893081198,
+      "duration_p95_std": 3.801339406999098,
+      "duration_p99_ms": 16.62175187879854,
+      "duration_p99_std": 8.040731027091837,
+      "throughput_qps": 439.87041742593595,
+      "throughput_qps_std": 12.711047488500965,
+      "recall_at_k": {
+        "1": 0.5636104673619158,
+        "5": 0.8782589803012746,
+        "10": 0.9357135959830051,
+        "20": 0.9664204325994592,
+        "50": 0.9844051757435304
+      },
+      "recall_at_k_std": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0,
+        "50": 0.0
+      },
+      "filtered_duration_p50_ms": 4.848062516733383,
+      "filtered_duration_p50_std": 0.09354654471158938,
+      "filtered_duration_p95_ms": 6.817892295657655,
+      "filtered_duration_p95_std": 0.054343736243972665,
+      "memory_mb": 438.0,
+      "num_runs": 3
+    }
+  ]
+}
