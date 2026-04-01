@@ -278,6 +278,14 @@ def run_benchmark_qdrant(
     for run in range(start_run, num_runs + 1):
         print(f"\n  --- Run {run}/{num_runs} ---")
 
+        # Wait for optimizer to be idle before measuring
+        print("  Waiting for optimizer to settle …")
+        while True:
+            info = client.get_collection(collection_name=collection)
+            if info.optimizer_status == "ok" or str(info.optimizer_status.value) == "ok":
+                break
+            time.sleep(0.5)
+
         print("  Measuring query duration …")
         lats = measure_durations(query_fn, query_vecs, k=10)
         p50 = float(np.percentile(lats, 50))

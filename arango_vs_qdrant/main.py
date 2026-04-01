@@ -218,57 +218,53 @@ def run_for_doc_count(doc_count: int, args) -> list[BenchmarkResult]:
 
     # ── Qdrant (all configs) ──
     if args.only != "arango":
-        any_needs_work = not all(qdrant_status.values())
-        if any_needs_work:
-            has_any_ingest = any(
-                ckpt.get(_qdrant_ckpt_key(cfg), {}).get("ingest")
-                for cfg in QDRANT_CONFIGS
-            )
-            start_container("qdrant", preserve_volumes=has_any_ingest)
+        for cfg in QDRANT_CONFIGS:
+            key = _qdrant_ckpt_key(cfg)
+            db_label = cfg["name"] if cfg else "Qdrant (Default)"
 
-        try:
-            for cfg in QDRANT_CONFIGS:
-                key = _qdrant_ckpt_key(cfg)
-                db_label = cfg["name"] if cfg else "Qdrant (Default)"
-
-                if qdrant_status[key]:
-                    print(f"  {db_label} ({label}) already complete.")
-                    result = _rebuild_from_checkpoint(ckpt[key], db_label, args.runs)
-                else:
-                    ckpt.setdefault(key, {})
-                    result = run_benchmark_qdrant(
-                        corpus, all_query_vecs, all_query_ids, qrels,
-                        num_runs=args.runs, ckpt_db=ckpt[key], save_fn=make_save_fn(),
-                        hnsw_config=cfg,
-                    )
+            if qdrant_status[key]:
+                print(f"  {db_label} ({label}) already complete.")
+                result = _rebuild_from_checkpoint(ckpt[key], db_label, args.runs)
                 all_results.append(result)
-        except Exception as e:
-            import subprocess
-            print(f"\n  !!! Qdrant benchmark failed: {e}")
+                continue
+
+            # Fresh container per config to avoid cross-config interference
+            has_ingest = bool(ckpt.get(key, {}).get("ingest"))
+            start_container("qdrant", preserve_volumes=has_ingest)
             try:
-                info = subprocess.run(
-                    ["docker", "inspect", "qdrant-bench",
-                     "--format",
-                     "OOMKilled={{.State.OOMKilled}} "
-                     "ExitCode={{.State.ExitCode}} "
-                     "Status={{.State.Status}} "
-                     "RestartCount={{.RestartCount}}"],
-                    capture_output=True, text=True, timeout=5,
+                ckpt.setdefault(key, {})
+                result = run_benchmark_qdrant(
+                    corpus, all_query_vecs, all_query_ids, qrels,
+                    num_runs=args.runs, ckpt_db=ckpt[key], save_fn=make_save_fn(),
+                    hnsw_config=cfg,
                 )
-                print(f"  Container state: {info.stdout.strip()}")
-            except Exception:
-                print("  (could not inspect container)")
-            try:
-                logs = subprocess.run(
-                    ["docker", "logs", "--tail", "30", "qdrant-bench"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                print(f"  Last 30 lines of container logs:\n{logs.stdout}{logs.stderr}")
-            except Exception:
-                print("  (could not fetch container logs)")
-            raise
-        finally:
-            if any_needs_work:
+                all_results.append(result)
+            except Exception as e:
+                import subprocess
+                print(f"\n  !!! Qdrant benchmark failed: {e}")
+                try:
+                    info = subprocess.run(
+                        ["docker", "inspect", "qdrant-bench",
+                         "--format",
+                         "OOMKilled={{.State.OOMKilled}} "
+                         "ExitCode={{.State.ExitCode}} "
+                         "Status={{.State.Status}} "
+                         "RestartCount={{.RestartCount}}"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    print(f"  Container state: {info.stdout.strip()}")
+                except Exception:
+                    print("  (could not inspect container)")
+                try:
+                    logs = subprocess.run(
+                        ["docker", "logs", "--tail", "30", "qdrant-bench"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    print(f"  Last 30 lines of container logs:\n{logs.stdout}{logs.stderr}")
+                except Exception:
+                    print("  (could not fetch container logs)")
+                raise
+            finally:
                 stop_container("qdrant")
 
     # ── Save & Plot ──
