@@ -2,7 +2,7 @@
 ArangoDB vs Qdrant — RAG Retrieval Benchmark
 =============================================
 Benchmarks: ingestion + index creation time, query duration (p50/p95/p99),
-throughput (QPS), recall@k (vs human qrels), and filtered search.
+throughput (QPS), low-k recall@k (vs human qrels), and filtered search.
 
 Runs across multiple document counts and Qdrant HNSW configurations.
 All queries and their relevant document IDs are used for comprehensive
@@ -17,10 +17,10 @@ from dataclasses import asdict
 import numpy as np
 from tabulate import tabulate
 
-from config import NUM_RUNS, HF_SUBSET
+from config import NUM_RUNS, HF_SUBSET, PRIMARY_RECALL_K
 from dataset import load_beir_dataset
 from docker import start_container, stop_container
-from measure import BenchmarkResult
+from measure import BenchmarkResult, has_topk_metric_series
 from arango_bench import run_benchmark_arango
 from qdrant_bench import run_benchmark_qdrant
 from plotting import plot_results
@@ -47,7 +47,10 @@ def _is_complete(ckpt: dict, db_key: str, num_runs: int) -> bool:
     db = ckpt.get(db_key, {})
     if not db.get("ingest"):
         return False
-    if len(db.get("runs", [])) < num_runs:
+    runs = db.get("runs", [])
+    if len(runs) < num_runs:
+        return False
+    if any(not has_topk_metric_series(run) for run in runs[:num_runs]):
         return False
     return True
 
@@ -77,12 +80,33 @@ def print_summary(all_results: list[BenchmarkResult], num_runs: int):
             _fmt(r.duration_p95_ms, r.duration_p95_std),
             _fmt(r.duration_p99_ms, r.duration_p99_std),
             _fmt(r.throughput_qps, r.throughput_qps_std),
-            _fmt(r.recall_at_k.get(10, 0), r.recall_at_k_std.get(10, 0), fmt=".4f"),
+            _fmt(
+                r.recall_at_k.get(PRIMARY_RECALL_K, 0),
+                r.recall_at_k_std.get(PRIMARY_RECALL_K, 0),
+                fmt=".4f",
+            ),
+            _fmt(
+                r.precision_at_k.get(PRIMARY_RECALL_K, 0),
+                r.precision_at_k_std.get(PRIMARY_RECALL_K, 0),
+                fmt=".4f",
+            ),
+            _fmt(
+                r.ndcg_at_k.get(PRIMARY_RECALL_K, 0),
+                r.ndcg_at_k_std.get(PRIMARY_RECALL_K, 0),
+                fmt=".4f",
+            ),
+            _fmt(
+                r.success_at_k.get(PRIMARY_RECALL_K, 0),
+                r.success_at_k_std.get(PRIMARY_RECALL_K, 0),
+                fmt=".4f",
+            ),
             _fmt(r.filtered_duration_p50_ms, r.filtered_duration_p50_std),
             f"{r.memory_mb:.1f}",
         ])
     headers = ["DB", "N", "Ingest+Idx(s)", "p50(ms)", "p95(ms)", "p99(ms)",
-               "QPS", "R@10", "Filt p50(ms)", "Mem(MB)"]
+               "QPS", f"R@{PRIMARY_RECALL_K}", f"P@{PRIMARY_RECALL_K}",
+               f"nDCG@{PRIMARY_RECALL_K}", f"S@{PRIMARY_RECALL_K}",
+               "Filt p50(ms)", "Mem(MB)"]
     print(tabulate(rows, headers=headers, tablefmt="github"))
 
 
@@ -100,9 +124,16 @@ def _rebuild_from_checkpoint(db_ckpt: dict, db_name: str, num_runs: int) -> Benc
     all_fp50 = [r["fp50"] for r in runs]
     all_fp95 = [r["fp95"] for r in runs]
     all_recall = {k: [] for k in TOP_K_VALUES}
+    all_precision = {k: [] for k in TOP_K_VALUES}
+    all_ndcg = {k: [] for k in TOP_K_VALUES}
+    all_success = {k: [] for k in TOP_K_VALUES}
     for r in runs:
         for k in TOP_K_VALUES:
             all_recall[k].append(r["recall"][str(k)])
+            if has_topk_metric_series(r):
+                all_precision[k].append(r["topk_metrics"]["precision"][str(k)])
+                all_ndcg[k].append(r["topk_metrics"]["ndcg"][str(k)])
+                all_success[k].append(r["topk_metrics"]["success"][str(k)])
 
     return BenchmarkResult(
         db_name=db_name,
@@ -119,6 +150,12 @@ def _rebuild_from_checkpoint(db_ckpt: dict, db_name: str, num_runs: int) -> Benc
         throughput_qps_std=stats.stdev(all_qps) if len(all_qps) > 1 else 0.0,
         recall_at_k={k: stats.mean(v) for k, v in all_recall.items()},
         recall_at_k_std={k: (stats.stdev(v) if len(v) > 1 else 0.0) for k, v in all_recall.items()},
+        precision_at_k={k: (stats.mean(v) if v else 0.0) for k, v in all_precision.items()},
+        precision_at_k_std={k: (stats.stdev(v) if len(v) > 1 else 0.0) for k, v in all_precision.items()},
+        ndcg_at_k={k: (stats.mean(v) if v else 0.0) for k, v in all_ndcg.items()},
+        ndcg_at_k_std={k: (stats.stdev(v) if len(v) > 1 else 0.0) for k, v in all_ndcg.items()},
+        success_at_k={k: (stats.mean(v) if v else 0.0) for k, v in all_success.items()},
+        success_at_k_std={k: (stats.stdev(v) if len(v) > 1 else 0.0) for k, v in all_success.items()},
         filtered_duration_p50_ms=stats.mean(all_fp50),
         filtered_duration_p50_std=stats.stdev(all_fp50) if len(all_fp50) > 1 else 0.0,
         filtered_duration_p95_ms=stats.mean(all_fp95),

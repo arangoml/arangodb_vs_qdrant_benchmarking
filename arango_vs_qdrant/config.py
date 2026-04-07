@@ -17,11 +17,12 @@ QDRANT_GRPC_PORT = 6334
 
 DIMENSIONS = 1024  # Cohere embed-english-v3.0
 TOP_K_VALUES = [1, 5, 10, 20, 50]
+PRIMARY_RECALL_K = 5
 CONTAINER_MEMORY_GB = 5  # Memory limit per container (from docker-compose)
 NUM_CATEGORIES = 10
 CPU_COUNT = os.cpu_count() or 4
 CONCURRENT_WORKERS = CPU_COUNT
-WARMUP_QUERIES = 50
+WARMUP_QUERIES = 1
 NUM_RUNS = 3  # Repeat measurements for statistical robustness
 BATCH_SIZE = 500  # Sub-batch size for database inserts
 

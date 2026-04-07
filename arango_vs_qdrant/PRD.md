@@ -56,7 +56,10 @@ Each configuration is measured across 3 independent runs (mean ± stddev reporte
 | Ingestion + index build time | Wall-clock time to insert all documents and build the vector index |
 | Query latency (p50, p95, p99) | Sequential single-query latency in ms, with 50-query warmup |
 | Throughput (QPS) | Queries per second under concurrent load (N workers = CPU count) |
-| Recall@k | Fraction of human-judged relevant documents in top-k results (k = 1, 5, 10, 20, 50) |
+| Recall@k | Fraction of human-judged relevant documents in top-k results; `recall@5` is the primary reported recall metric |
+| Precision@k | Fraction of the top-k results that are human-judged relevant; `precision@5` is the primary reported precision metric |
+| nDCG@k | Ranking quality at top-k with higher weight on earlier relevant hits; `nDCG@5` is the primary reported nDCG metric |
+| Success@k | Fraction of queries with at least one relevant document in the top-k results; `success@5` is the primary reported success metric |
 | Filtered search latency | Query latency with a keyword payload filter (`category`) |
 | Memory usage | Container RSS via Docker stats, measured after ingestion + indexing |
 
@@ -70,7 +73,7 @@ Each configuration is measured across 3 independent runs (mean ± stddev reporte
 6. Run 3 measurement passes, each consisting of:
    - Sequential latency measurement (all queries, with warmup)
    - Concurrent throughput measurement
-   - Recall@k computation against BEIR qrels
+   - Recall@k plus low-k quality metrics (`precision@5`, `nDCG@5`, `success@5`) computed from the same retrieved result sets against BEIR qrels
    - Filtered search latency measurement
 7. Aggregate results (mean ± stddev) and generate comparison plots
 
@@ -79,4 +82,4 @@ Checkpointing is supported — interrupted runs resume from the last completed s
 ## Output
 
 - `results.json` — raw benchmark data per doc-count
-- 7 comparison plots (load time, query duration, throughput, recall@k, filtered duration, radar summary, memory usage)
+- 10 comparison plots (load time, query duration, throughput, recall@k, filtered duration, radar summary, memory usage, precision@k, nDCG@k, success@k)

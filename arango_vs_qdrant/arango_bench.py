@@ -11,13 +11,14 @@ import numpy as np
 
 from config import (
     ARANGO_HOST, ARANGO_DB, ARANGO_USER, ARANGO_PASS, ARANGO_COLLECTION,
-    DIMENSIONS, TOP_K_VALUES, CONTAINER_MEMORY_GB,
+    DIMENSIONS, TOP_K_VALUES, PRIMARY_RECALL_K, CONTAINER_MEMORY_GB,
     BATCH_SIZE, CONCURRENT_WORKERS, NUM_CATEGORIES, NUM_RUNS,
 )
 from docker import get_container_memory_usage_mb
 from measure import (
     BenchmarkResult,
-    measure_durations, compute_recall_qrels,
+    measure_durations, compute_recall_qrels, compute_topk_metrics_qrels,
+    has_topk_metric_series,
 )
 
 
@@ -316,15 +317,24 @@ def run_benchmark_arango(
         save_fn()
 
     # --- Measurement runs ---
-    completed_runs = ckpt_db.get("runs", [])
+    completed_runs = [r for r in ckpt_db.get("runs", []) if has_topk_metric_series(r)]
+    if len(completed_runs) != len(ckpt_db.get("runs", [])):
+        ckpt_db["runs"] = completed_runs
+        save_fn()
     all_p50 = [r["p50"] for r in completed_runs]
     all_p95 = [r["p95"] for r in completed_runs]
     all_p99 = [r["p99"] for r in completed_runs]
     all_qps = [r["qps"] for r in completed_runs]
     all_recall = {k: [] for k in TOP_K_VALUES}
+    all_precision = {k: [] for k in TOP_K_VALUES}
+    all_ndcg = {k: [] for k in TOP_K_VALUES}
+    all_success = {k: [] for k in TOP_K_VALUES}
     for r in completed_runs:
         for k in TOP_K_VALUES:
             all_recall[k].append(r["recall"][str(k)])
+            all_precision[k].append(r["topk_metrics"]["precision"][str(k)])
+            all_ndcg[k].append(r["topk_metrics"]["ndcg"][str(k)])
+            all_success[k].append(r["topk_metrics"]["success"][str(k)])
     all_fp50 = [r["fp50"] for r in completed_runs]
     all_fp95 = [r["fp95"] for r in completed_runs]
 
@@ -359,6 +369,21 @@ def run_benchmark_arango(
             all_recall[k].append(recall)
             run_recall[str(k)] = recall
             print(f"    recall@{k} = {recall:.4f}")
+        run_topk_metrics = {"precision": {}, "ndcg": {}, "success": {}}
+        for k in TOP_K_VALUES:
+            topk_metrics = compute_topk_metrics_qrels(
+                retrieved_max_k, query_ids, qrels, k=k,
+            )
+            all_precision[k].append(topk_metrics["precision"])
+            all_ndcg[k].append(topk_metrics["ndcg"])
+            all_success[k].append(topk_metrics["success"])
+            run_topk_metrics["precision"][str(k)] = topk_metrics["precision"]
+            run_topk_metrics["ndcg"][str(k)] = topk_metrics["ndcg"]
+            run_topk_metrics["success"][str(k)] = topk_metrics["success"]
+            if k == PRIMARY_RECALL_K:
+                print(f"    precision@{k} = {topk_metrics['precision']:.4f}")
+                print(f"    ndcg@{k} = {topk_metrics['ndcg']:.4f}")
+                print(f"    success@{k} = {topk_metrics['success']:.4f}")
 
         print("  Measuring filtered search duration …")
         f_lats = measure_durations(
@@ -375,6 +400,7 @@ def run_benchmark_arango(
         ckpt_db["runs"].append({
             "p50": p50, "p95": p95, "p99": p99,
             "qps": qps, "recall": run_recall,
+            "topk_metrics": run_topk_metrics,
             "fp50": fp50, "fp95": fp95,
         })
         save_fn()
@@ -394,6 +420,12 @@ def run_benchmark_arango(
         throughput_qps_std=statistics.stdev(all_qps) if len(all_qps) > 1 else 0.0,
         recall_at_k={k: statistics.mean(v) for k, v in all_recall.items()},
         recall_at_k_std={k: (statistics.stdev(v) if len(v) > 1 else 0.0) for k, v in all_recall.items()},
+        precision_at_k={k: statistics.mean(v) for k, v in all_precision.items()},
+        precision_at_k_std={k: (statistics.stdev(v) if len(v) > 1 else 0.0) for k, v in all_precision.items()},
+        ndcg_at_k={k: statistics.mean(v) for k, v in all_ndcg.items()},
+        ndcg_at_k_std={k: (statistics.stdev(v) if len(v) > 1 else 0.0) for k, v in all_ndcg.items()},
+        success_at_k={k: statistics.mean(v) for k, v in all_success.items()},
+        success_at_k_std={k: (statistics.stdev(v) if len(v) > 1 else 0.0) for k, v in all_success.items()},
         filtered_duration_p50_ms=statistics.mean(all_fp50),
         filtered_duration_p50_std=statistics.stdev(all_fp50) if len(all_fp50) > 1 else 0.0,
         filtered_duration_p95_ms=statistics.mean(all_fp95),

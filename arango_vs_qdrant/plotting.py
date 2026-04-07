@@ -6,12 +6,34 @@ from pathlib import Path
 
 import numpy as np
 
-from config import CONTAINER_MEMORY_GB
+from config import CONTAINER_MEMORY_GB, PRIMARY_RECALL_K
 from measure import BenchmarkResult
 
 
 COLORS = ["#68A063", "#DC382C", "#1E88E5", "#FFC107", "#7B1FA2"]
 MARKERS = ["o", "s", "^", "D", "v"]
+
+
+def _plot_metric_at_k(fig, ax, all_results, labels, colors, n, footnote, attr_name, ylabel, title):
+    for i, r in enumerate(all_results):
+        values = getattr(r, attr_name)
+        ks = sorted(values.keys())
+        ax.plot(
+            ks,
+            [values[k] for k in ks],
+            f"{MARKERS[i % len(MARKERS)]}-",
+            label=labels[i],
+            color=colors[i],
+            linewidth=2,
+            markersize=7,
+        )
+    ax.set_xlabel("K")
+    ax.set_ylabel(ylabel)
+    ax.set_title(f"{title}  (N={n:,})")
+    ax.set_ylim(0, 1.05)
+    ax.legend(fontsize=8)
+    fig.text(0.5, -0.02, footnote, ha="center", fontsize=7, style="italic", color="grey")
+    fig.tight_layout()
 
 
 def plot_results(all_results: list[BenchmarkResult], out_dir: Path):
@@ -118,7 +140,7 @@ def plot_results(all_results: list[BenchmarkResult], out_dir: Path):
 
     # ---- 6. Radar / Spider chart ----
     metrics_labels = ["Ingest+Idx", "p50 Lat", "p99 Lat",
-                      "Throughput", "Recall@10", "Filt. Lat"]
+                      "Throughput", f"Recall@{PRIMARY_RECALL_K}", "Filt. Lat"]
     lower_better = {0, 1, 2, 5}
 
     raw = []
@@ -128,7 +150,7 @@ def plot_results(all_results: list[BenchmarkResult], out_dir: Path):
             r.duration_p50_ms,
             r.duration_p99_ms,
             r.throughput_qps,
-            r.recall_at_k.get(10, 0),
+            r.recall_at_k.get(PRIMARY_RECALL_K, 0),
             r.filtered_duration_p50_ms,
         ])
 
@@ -175,6 +197,33 @@ def plot_results(all_results: list[BenchmarkResult], out_dir: Path):
     fig.text(0.5, -0.02, footnote, ha="center", fontsize=7, style="italic", color="grey")
     fig.tight_layout()
     fig.savefig(out_dir / "07_memory_usage.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    # ---- 8. Precision@K ----
+    fig, ax = plt.subplots(figsize=(8, 5))
+    _plot_metric_at_k(
+        fig, ax, all_results, labels, colors, n, footnote,
+        "precision_at_k", "Precision@K", "Precision@K",
+    )
+    fig.savefig(out_dir / "08_precision_at_k.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    # ---- 9. nDCG@K ----
+    fig, ax = plt.subplots(figsize=(8, 5))
+    _plot_metric_at_k(
+        fig, ax, all_results, labels, colors, n, footnote,
+        "ndcg_at_k", "nDCG@K", "nDCG@K",
+    )
+    fig.savefig(out_dir / "09_ndcg_at_k.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    # ---- 10. Success@K ----
+    fig, ax = plt.subplots(figsize=(8, 5))
+    _plot_metric_at_k(
+        fig, ax, all_results, labels, colors, n, footnote,
+        "success_at_k", "Success@K", "Success@K",
+    )
+    fig.savefig(out_dir / "10_success_at_k.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
     print(f"\n  Charts saved to {out_dir}/")
