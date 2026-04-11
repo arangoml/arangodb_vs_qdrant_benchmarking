@@ -68,7 +68,8 @@ def setup_qdrant(dim: int, m: int | None = None, ef_construct: int | None = None
 
 def query_qdrant(client, collection: str, query_vec: list[float], k: int,
                  category_filter: str | None = None,
-                 ef: int | None = None) -> list[str]:
+                 ef: int | None = None,
+                 point_id_to_doc_id: list[str] | None = None) -> list[str]:
     from qdrant_client.models import Filter, FieldCondition, MatchValue, SearchParams
 
     search_filter = None
@@ -88,12 +89,15 @@ def query_qdrant(client, collection: str, query_vec: list[float], k: int,
         query_filter=search_filter,
         search_params=search_params,
     )
-    return [hit.payload["doc_id"] for hit in results.points]
+    if point_id_to_doc_id is None:
+        raise ValueError("point_id_to_doc_id mapping is required for Qdrant benchmark queries")
+    return [point_id_to_doc_id[int(hit.id)] for hit in results.points]
 
 
 def measure_throughput_qdrant(collection: str, query_vecs: np.ndarray, k: int,
                               category_filter: str | None = None,
                               ef: int | None = None,
+                              point_id_to_doc_id: list[str] | None = None,
                               workers: int = CONCURRENT_WORKERS) -> float:
     """Run Qdrant queries concurrently with per-thread clients."""
     import threading
@@ -107,7 +111,15 @@ def measure_throughput_qdrant(collection: str, query_vecs: np.ndarray, k: int,
 
     def _query(q, k):
         client = _get_client()
-        return query_qdrant(client, collection, q, k, category_filter=category_filter, ef=ef)
+        return query_qdrant(
+            client,
+            collection,
+            q,
+            k,
+            category_filter=category_filter,
+            ef=ef,
+            point_id_to_doc_id=point_id_to_doc_id,
+        )
 
     q_list = [q.tolist() for q in query_vecs]
     start = time.perf_counter()
@@ -217,6 +229,8 @@ def run_benchmark_qdrant(
         m = None
         ef_construct = None
 
+    point_id_to_doc_id = sorted(corpus.keys())
+
     print(f"\n{'='*60}")
     print(f"  {db_label}  |  {len(corpus):,} docs  |  index = HNSW  |  protocol = gRPC")
     print(f"{'='*60}")
@@ -282,7 +296,9 @@ def run_benchmark_qdrant(
     if start_run > 1:
         print(f"\n  Resuming from run {start_run} ({start_run - 1} runs already saved)")
 
-    query_fn = lambda q, k: query_qdrant(client, collection, q, k, ef=ef_search)
+    query_fn = lambda q, k: query_qdrant(
+        client, collection, q, k, ef=ef_search, point_id_to_doc_id=point_id_to_doc_id,
+    )
     max_k = max(TOP_K_VALUES)
 
     for run in range(start_run, num_runs + 1):
@@ -298,12 +314,17 @@ def run_benchmark_qdrant(
         all_p99.append(p99)
 
         print(f"  Measuring throughput ({CONCURRENT_WORKERS} workers) …")
-        qps = measure_throughput_qdrant(collection, query_vecs, k=10, ef=ef_search)
+        qps = measure_throughput_qdrant(
+            collection, query_vecs, k=10, ef=ef_search, point_id_to_doc_id=point_id_to_doc_id,
+        )
         all_qps.append(qps)
 
         print("  Computing recall@k (vs human relevance judgments) …")
         retrieved_max_k = [
-            query_qdrant(client, collection, q.tolist(), max_k, ef=ef_search)
+            query_qdrant(
+                client, collection, q.tolist(), max_k, ef=ef_search,
+                point_id_to_doc_id=point_id_to_doc_id,
+            )
             for q in query_vecs
         ]
         run_recall = {}
@@ -332,6 +353,7 @@ def run_benchmark_qdrant(
         f_lats = measure_durations(
             lambda q, k: query_qdrant(
                 client, collection, q, k, category_filter="cat_0", ef=ef_search,
+                point_id_to_doc_id=point_id_to_doc_id,
             ),
             query_vecs, k=10,
         )

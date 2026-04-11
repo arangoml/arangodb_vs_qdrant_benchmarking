@@ -22,8 +22,8 @@ CONTAINER_MEMORY_GB = 5  # Memory limit per container (from docker-compose)
 NUM_CATEGORIES = 10
 CPU_COUNT = os.cpu_count() or 4
 CONCURRENT_WORKERS = CPU_COUNT
-WARMUP_QUERIES = 1
-NUM_RUNS = 3  # Repeat measurements for statistical robustness
+WARMUP_QUERIES = 0  # Align with Qdrant's official vector-db-benchmark search harness
+NUM_RUNS = 5  # Repeat measurements for statistical robustness
 BATCH_SIZE = 500  # Sub-batch size for database inserts
 
 HF_DATASET = "Cohere/beir-embed-english-v3"

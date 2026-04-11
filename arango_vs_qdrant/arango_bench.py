@@ -147,7 +147,7 @@ def query_arango(db, query_vec: list[float], k: int,
             RETURN doc.doc_id
         """
 
-    cursor = db.aql.execute(aql, bind_vars=bind, count=True)
+    cursor = db.aql.execute(aql, bind_vars=bind)
     return list(cursor)
 
 
