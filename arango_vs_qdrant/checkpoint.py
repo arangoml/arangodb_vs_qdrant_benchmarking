@@ -32,16 +32,4 @@ def save_checkpoint(out_dir: Path, data: dict):
     tmp = p.with_suffix(".tmp")
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
-    tmp.rename(p)
-
-
-def db_is_complete(ckpt: dict, db_key: str, num_runs: int, pareto_count: int) -> bool:
-    """Check if a database benchmark is fully complete."""
-    db = ckpt.get(db_key, {})
-    if not db.get("ingest"):
-        return False
-    if len(db.get("runs", [])) < num_runs:
-        return False
-    if len(db.get("pareto", [])) < pareto_count:
-        return False
-    return True
+    tmp.replace(p)
