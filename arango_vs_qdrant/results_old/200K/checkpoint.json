@@ -1,7 +1,0 @@
-{
-  "arango": {},
-  "qdrant": {},
-  "qdrant_qdrant_m32_efc200_efs128": {},
-  "qdrant_qdrant_m8_efc50_efs32": {},
-  "qdrant_qdrant_m24_efc150_efs96": {}
-}

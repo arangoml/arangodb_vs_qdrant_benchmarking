@@ -32,4 +32,4 @@ def save_checkpoint(out_dir: Path, data: dict):
     tmp = p.with_suffix(".tmp")
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
-    tmp.rename(p)
+    tmp.replace(p)
